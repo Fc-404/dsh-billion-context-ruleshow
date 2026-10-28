@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "ACP 规则侧栏",
+    "description": "在会话聊天页左侧空白处显示当前 acp_rule 规则列表，紧贴聊天列。"
+  },
+  "title": "规则"
+}

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "ACP Rules Gutter",
+    "description": "Shows the active acp_rule list in the empty left gutter of the chat page, next to the chat column."
+  },
+  "title": "Rules"
+}

@@ -1,0 +1,32 @@
+{
+  "name": "dsh-billion-context-ruleshow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shows the active acp_rule list in the empty left gutter of the chat page.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "billion-context": ">=0.1.208"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["billion-context"]
+    }
+  }
+}
