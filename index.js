@@ -1,11 +1,14 @@
 /**
- * Host half of the acp-rules panel bundle.
+ * billion-context 规则侧栏的 Host 半边。
  *
- * The billion-context plugin registers the `acp_rule` tool from the
- * billion-context proxy manifest into this session, so every rule change is written to
- * the session log as a normal `tool/call` + `tool/result` pair. This module
- * folds that log into the current rule list and serves it on a same-origin
- * route; the Client half only renders the result.
+ * billion-context 插件把 `acp_rule` 工具注册进当前会话，因此每次规则变更都会
+ * 以普通 `tool/call` + `tool/result` 事件写进会话日志。本插件把这段日志增量
+ * 折叠成「当前规则列表」，并通过两条通道交给 Client：
+ *
+ * 1. session projection（主通道）：事件驱动、每个事件 O(1)，Client 直接订阅
+ *    projection 的 wire view，不需要轮询；
+ * 2. 同源 HTTP 路由（兜底 + 校准）：Client 拿不到会话绑定时退化为低频轮询，
+ *    同时用它校准 billion-context 是否启用。
  */
 
 import { readFileSync } from 'node:fs'
@@ -14,17 +17,23 @@ import { join } from 'node:path'
 
 export const name = 'billion-context-ruleshow'
 
-/** Services that must be ready before this plugin mounts. */
-export const inject = ['agents', 'webServer']
+/** 必须先就绪的服务：会话查询、路由注册、投影注册。 */
+export const inject = ['agents', 'webServer', 'sessionProjections']
 
 const RULE_TOOL_NAME = 'acp_rule'
 const ROUTE_PATH = '/dsh-billion-context-ruleshow/state'
+
+/** Client 订阅用的投影 key，两侧必须一致。 */
+const RULES_PROJECTION_KEY = 'billion-context-rules'
+
+/** 未匹配结果的 pending 调用的上限，防止异常会话把状态撑大。 */
+const PENDING_LIMIT = 256
 
 /** 本面板只服务 billion-context 插件：判断它在当前 profile 是否启用。 */
 const BILLION_CONTEXT_BUNDLE = 'billion-context'
 const BILLION_CONTEXT_PLUGIN_IDS = ['bili-native', 'bili-compaction-gate', 'billion-context']
 
-/** Result fragments that mean the rule tool refused the change. */
+/** 这些结果片段表示规则工具拒绝了本次变更。 */
 const FAILURE_HINTS = [
   'rule text is empty',
   'char limit',
@@ -33,7 +42,10 @@ const FAILURE_HINTS = [
   'no rule with id'
 ]
 
-/** Read plain text out of a tool-result message content value. */
+/** 投影 schema 只用到 parse（含 stateSchema 与 wire.viewSchema）。 */
+const PASS_SCHEMA = { parse: (value) => value }
+
+/** 从 tool-result 消息的 content 里取出纯文本。 */
 function contentText(content) {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
@@ -48,7 +60,7 @@ function contentText(content) {
   return ''
 }
 
-/** Whether a tool-result body reports a refused rule change. */
+/** 结果文本是否表示本次规则变更被拒绝。 */
 function isFailureText(text, isError) {
   if (isError === true) return true
   const body = text.trim()
@@ -56,7 +68,7 @@ function isFailureText(text, isError) {
   return FAILURE_HINTS.some((hint) => body.includes(hint))
 }
 
-/** Classify `acp_rule` tool arguments into one of the four operations. */
+/** 把 `acp_rule` 的入参归类为四种操作之一。 */
 function classifyArguments(args) {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) return { kind: 'list' }
   if (typeof args.rule === 'string') return { kind: 'add', text: args.rule }
@@ -65,7 +77,7 @@ function classifyArguments(args) {
   return { kind: 'list' }
 }
 
-/** Parse raw tool-call arguments (JSON text, or an already parsed object). */
+/** 解析 tool-call 的原始入参（JSON 字符串或已解析对象）。 */
 function parseToolArguments(raw) {
   if (raw === null || raw === undefined) return { kind: 'list' }
   if (typeof raw === 'object') return classifyArguments(raw)
@@ -78,7 +90,7 @@ function parseToolArguments(raw) {
   }
 }
 
-/** Highest `ruleN` number already present in the list. */
+/** 规则列表里已出现的最大 `ruleN` 编号。 */
 function highestRuleNumber(rules) {
   let highest = 0
   for (const rule of rules) {
@@ -88,7 +100,7 @@ function highestRuleNumber(rules) {
   return highest
 }
 
-/** Parse the tool's authoritative rule listing into `[{ id, text }]`. */
+/** 把工具返回的权威规则列表解析成 `[{ id, text }]`。 */
 function parseRulesList(text) {
   const body = text.trim()
   if (/^no rules recorded\.?$/i.test(body)) return []
@@ -107,7 +119,7 @@ function parseRulesList(text) {
   return rules.map((rule) => ({ id: rule.id, text: rule.text.replace(/\s+$/, '') }))
 }
 
-/** Apply a rule call optimistically so the panel reacts before the result. */
+/** 先乐观应用一次规则调用，让面板在结果回来前就反应。 */
 function beginCall(state, callId, operation) {
   const key = `pending:${callId}`
   if (operation.kind === 'add') {
@@ -132,7 +144,7 @@ function beginCall(state, callId, operation) {
   return { operation, key }
 }
 
-/** Reconcile the optimistic rule list with the tool result that settles it. */
+/** 用工具结果校正乐观列表，得到权威状态。 */
 function settleCall(state, pending, text, message) {
   const failure = isFailureText(text, message?.isError === true)
   const body = text.trim()
@@ -153,7 +165,7 @@ function settleCall(state, pending, text, message) {
       state.rules = state.rules.filter((rule) => rule.id !== pending.ruleId)
       return
     }
-    // Unknown success wording: keep the optimistic entry but drop its marker.
+    // 成功但措辞未知：保留乐观项，只去掉标记。
     state.rules = state.rules.map((rule) => (rule.pending === pending.key ? { id: rule.id, text: rule.text } : rule))
     return
   }
@@ -180,7 +192,63 @@ function settleCall(state, pending, text, message) {
   }
 }
 
-/** Fold one session's event log into the rule list it currently holds. */
+/** 初始投影状态（可序列化，供 checkpoint/restore 使用）。 */
+function initialState() {
+  return { rules: [], nextId: 1, pending: {} }
+}
+
+/**
+ * 把一条会话事件应用到投影状态。
+ * 无变化时返回同一引用（投影注册表靠 Object.is 判断是否通知）。
+ */
+function stepProjectionState(state, event) {
+  const data = event?.data
+  if (event?.type === 'tool/call') {
+    if (data?.name !== RULE_TOOL_NAME) return state
+    const callId = String(data.callId)
+    const next = { rules: state.rules, nextId: state.nextId, pending: { ...state.pending } }
+    next.pending[callId] = beginCall(next, callId, parseToolArguments(data.arguments))
+    const keys = Object.keys(next.pending)
+    if (keys.length > PENDING_LIMIT) delete next.pending[keys[0]]
+    return next
+  }
+  if (event?.type === 'tool/result') {
+    const message = data?.message
+    const callId = message?.source?.callId
+    if (callId === undefined) return state
+    const key = String(callId)
+    const pending = state.pending[key]
+    if (pending === undefined) return state
+    const next = { rules: state.rules, nextId: state.nextId, pending: { ...state.pending } }
+    delete next.pending[key]
+    settleCall(next, pending, contentText(message?.content), message)
+    return next
+  }
+  return state
+}
+
+/** 把投影状态里的规则整理成对外形状。 */
+function visibleRules(rules) {
+  if (!Array.isArray(rules)) return []
+  return rules
+    .filter((rule) => rule !== null && typeof rule === 'object' && typeof rule.text === 'string' && rule.text.trim() !== '')
+    .map((rule) => ({ id: String(rule.id ?? ''), text: rule.text }))
+}
+
+/** 注册给 sessionProjections 的增量投影定义。 */
+const rulesProjection = {
+  key: RULES_PROJECTION_KEY,
+  stateVersion: 1,
+  stateSchema: PASS_SCHEMA,
+  init: () => initialState(),
+  apply: (state, event) => stepProjectionState(state === undefined ? initialState() : state, event),
+  wire: {
+    viewSchema: PASS_SCHEMA,
+    view: (state) => ({ rules: visibleRules(state?.rules) })
+  }
+}
+
+/** 兜底：会话没有投影（例如注册表尚未构建）时，全量折叠一次事件日志。 */
 function foldRules(session) {
   const state = { rules: [], nextId: 1, pending: new Map() }
   const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : []
@@ -190,7 +258,7 @@ function foldRules(session) {
       if (data?.name !== RULE_TOOL_NAME) continue
       const callId = String(data.callId)
       state.pending.set(callId, beginCall(state, callId, parseToolArguments(data.arguments)))
-      if (state.pending.size > 256) state.pending.delete(state.pending.keys().next().value)
+      if (state.pending.size > PENDING_LIMIT) state.pending.delete(state.pending.keys().next().value)
       continue
     }
     if (event?.type === 'tool/result') {
@@ -204,12 +272,19 @@ function foldRules(session) {
       settleCall(state, pending, contentText(message?.content), message)
     }
   }
-  return state.rules
-    .filter((rule) => typeof rule.text === 'string' && rule.text.trim() !== '')
-    .map((rule) => ({ id: rule.id, text: rule.text }))
+  return visibleRules(state.rules)
 }
 
-/** Resolve the session a chat page is showing, live agent first. */
+/** 优先读增量投影，退不到投影时再全量折叠；via 用于诊断数据通道。 */
+function readRules(ctx, session) {
+  try {
+    const state = ctx.sessionProjections.stateOf(session, RULES_PROJECTION_KEY)
+    if (state !== undefined && state !== null) return { rules: visibleRules(state.rules), via: 'projection' }
+  } catch {}
+  return { rules: foldRules(session), via: 'fold' }
+}
+
+/** 找到聊天页当前显示的会话，活跃 agent 优先。 */
 function findSession(ctx, sessionId) {
   if (typeof sessionId !== 'string' || sessionId === '') return undefined
   try {
@@ -232,7 +307,7 @@ function profileDir() {
   return join(home, 'profiles', process.env.DSH_PROFILE ?? 'desktop')
 }
 
-/** billion-context插件是否在当前 profile 里启用：看插件清单与 patch 里的禁用覆盖。 */
+/** billion-context 插件是否在当前 profile 里启用：看插件清单与 patch 里的禁用覆盖。 */
 function readBillionContextEnabled() {
   const dir = profileDir()
   let manifest
@@ -263,16 +338,16 @@ function readBillionContextEnabled() {
 
 let billionContextEnabledCache = { value: undefined, at: 0 }
 
-/** 读盘结果缓存几秒，轮询时不会反复读配置文件。 */
+/** 读盘结果缓存几秒，路由被校准时不会反复读配置文件。 */
 function billionContextEnabled() {
   const now = Date.now()
-  if (billionContextEnabledCache.value !== undefined && now - billionContextEnabledCache.at < 3000) return billionContextEnabledCache.value
+  if (billionContextEnabledCache.value !== undefined && now - billionContextEnabledCache.at < 5000) return billionContextEnabledCache.value
   const value = readBillionContextEnabled()
   billionContextEnabledCache = { value, at: now }
   return value
 }
 
-/** Serve the folded rule list as JSON for the Client half. */
+/** 把规则列表与启用状态作为 JSON 返回给 Client（兜底与校准通道）。 */
 function handleState(ctx) {
   return (request, response) => {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -286,9 +361,12 @@ function handleState(ctx) {
       const sessionId = url.searchParams.get('sessionId') ?? undefined
       const session = findSession(ctx, sessionId)
       const billionContextOn = billionContextEnabled()
-      payload = session === undefined
-        ? { ok: false, billionContextEnabled: billionContextOn, rules: [], error: 'session not found' }
-        : { ok: true, billionContextEnabled: billionContextOn, rules: foldRules(session) }
+      if (session === undefined) {
+        payload = { ok: false, billionContextEnabled: billionContextOn, rules: [], error: 'session not found' }
+      } else {
+        const loaded = readRules(ctx, session)
+        payload = { ok: true, billionContextEnabled: billionContextOn, rules: loaded.rules, via: loaded.via }
+      }
     } catch (error) {
       payload = { ok: false, rules: [], error: String(error?.message ?? error) }
     }
@@ -302,8 +380,12 @@ function handleState(ctx) {
   }
 }
 
-/** Register the same-origin route the panel polls. */
+/** 注册增量投影与同源路由。 */
 export function apply(ctx) {
+  ctx.effect(
+    () => ctx.sessionProjections.register(rulesProjection),
+    'billion-context-ruleshow: rules projection'
+  )
   ctx.effect(
     () => ctx.webServer.register({ kind: 'exact', path: ROUTE_PATH, handler: handleState(ctx) }),
     'billion-context-ruleshow: rules route'

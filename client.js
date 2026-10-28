@@ -1,10 +1,12 @@
 /**
- * Client half of the acp-rules panel bundle.
+ * billion-context 规则侧栏的 Client 半边。
  *
- * Renders the current `acp_rule` list into the empty left gutter of the chat
- * page: a light-grey, right-aligned, wrapping block that hugs the chat column.
- * It hides itself when that gutter is too narrow, and never captures pointer
- * events (the chat underneath stays fully usable).
+ * 渲染当前 `acp_rule` 列表到聊天页的左侧空白：浅灰、靠右、自动换行，紧贴聊天列；
+ * 空白不足时隐藏，并且永远不拦截指针事件。
+ *
+ * 数据主通道是 session projection 的 wire view：Host 侧增量折叠会话事件，
+ * Client 通过会话绑定直接订阅（变化即时到达，不轮询）。
+ * 只有拿不到会话绑定时才退化为低频轮询同源路由。
  */
 
 window.__ModuleLoader__.load({
@@ -15,8 +17,17 @@ window.__ModuleLoader__.load({
 
     const NS = 'acp-rules'
     const ROUTE = '/dsh-billion-context-ruleshow/state'
-    const POLL_MS = 2000
-    const MEASURE_MS = 600
+    const RULES_KEY = 'billion-context-rules'
+
+    /** 兜底轮询间隔：只在订阅不可用时使用。 */
+    const POLL_MS = 5000
+    /** 校准间隔：低频拉取 billion-context 是否启用（订阅通道不带该字段）。 */
+    const META_MS = 15000
+    /** 可见会话检查间隔：只读 DOM，代价极低。 */
+    const SESSION_CHECK_MS = 1200
+    /** 布局兜底重测间隔（正常情况下由 ResizeObserver 驱动）。 */
+    const MEASURE_FALLBACK_MS = 1500
+
     const MAX_WIDTH = 320
     const MIN_WIDTH = 140
     const HIDE_GUTTER = 180
@@ -33,10 +44,13 @@ window.__ModuleLoader__.load({
       en: { title: 'Rules' }
     }
 
-    /** Resolved same-origin route, probed once and reused after that. */
+    /** 由 apply 注入的 DSH Client sessions 服务；为空时走路由轮询。 */
+    let sessionsApi = null
+
+    /** 解析成功的同源路由，探测一次后复用。 */
     let resolvedRoute
 
-    /** Read the folded rule list for one session; undefined when unreachable. */
+    /** 读某个会话的规则快照（兜底/校准通道）；不可达时返回 undefined。 */
     async function readRules(sessionId, signal) {
       const query = `?sessionId=${encodeURIComponent(sessionId)}`
       const candidates = resolvedRoute === undefined ? [ROUTE, ROUTE.slice(1)] : [resolvedRoute]
@@ -70,7 +84,15 @@ window.__ModuleLoader__.load({
       return undefined
     }
 
-    /** Parse a CSS length in px; undefined for anything else. */
+    /** 把任意来源的规则数组整理成 `[{ id, text }]`。 */
+    function normaliseRules(list) {
+      if (!Array.isArray(list)) return []
+      return list
+        .filter((rule) => rule !== null && typeof rule === 'object' && typeof rule.text === 'string' && rule.text !== '')
+        .map((rule) => ({ id: String(rule.id ?? ''), text: rule.text }))
+    }
+
+    /** 解析 px 长度；其他单位返回 undefined。 */
     function parsePx(value) {
       const text = String(value ?? '').trim()
       if (!text.endsWith('px')) return undefined
@@ -78,7 +100,7 @@ window.__ModuleLoader__.load({
       return Number.isFinite(number) ? number : undefined
     }
 
-    /** Nearest ancestor of the chat flow slot that owns a real box: the chat column. */
+    /** 从 chat flow 槽向上找真正有盒子的祖先：聊天列。 */
     function chatColumnElement(body, bodyRect) {
       const flow = body.querySelector(FLOW_SELECTOR)
       let node = flow
@@ -96,7 +118,7 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    /** Box of the centred chat column, resolved from the DOM or the width custom properties. */
+    /** 聊天列的盒子：优先真实元素，其次读宽度自定义属性。 */
     function chatColumnRect(body, bodyRect) {
       const column = chatColumnElement(body, bodyRect)
       if (column !== null) return column.getBoundingClientRect()
@@ -113,12 +135,12 @@ window.__ModuleLoader__.load({
       return { left, right: left + width, width, top: bodyRect.top, bottom: bodyRect.bottom, height: bodyRect.height }
     }
 
-    /** 当前是否处于「对话」标签：轨迹、上下文标签下没有 chat flow 槽。 */
+    /** 当前是否在「对话」标签：轨迹、上下文标签下没有 chat flow 槽。 */
     function hasChatView() {
       return document.querySelector(FLOW_SELECTOR) !== null
     }
 
-    /** Measure where the panel may sit: the left gutter, next to the chat column. */
+    /** 量出面板位置：左侧空白、紧贴聊天列。 */
     function measure() {
       if (!hasChatView()) return null
       const body = document.querySelector(BODY_SELECTOR)
@@ -147,7 +169,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Session id the chat page is showing right now, read from the conversation DOM. */
+    /** 聊天页当前展示的会话 id（从会话 DOM 读取）。 */
     function visibleSessionId() {
       const body = document.querySelector(BODY_SELECTOR)
       const id = body === null ? null : body.getAttribute('data-conversation-session')
@@ -172,63 +194,153 @@ window.__ModuleLoader__.load({
       return true
     }
 
-    /** The gutter-side rule list. */
+    /** 左侧空白里的规则列表。 */
     function AcpRulesPanel(props) {
       const t = props.t
       const [data, setData] = React.useState({ sessionId: undefined, rules: [], billionContextEnabled: false })
       const [place, setPlace] = React.useState(null)
 
+      // 数据通道：优先订阅会话投影的 wire view，拿不到绑定时退化为低频轮询。
       React.useEffect(() => {
         let cancelled = false
-        const controller = new AbortController()
-        const load = async () => {
-          const sessionId = visibleSessionId()
-          if (sessionId === undefined) {
-            if (!cancelled) {
-              setData((previous) => (
-                previous.sessionId === undefined && previous.rules.length === 0
-                  ? previous
-                  : { sessionId: undefined, rules: [], billionContextEnabled: previous.billionContextEnabled }
-              ))
+        let subscription = null
+        let subscribedSession
+        let pollTimer = null
+        let sessionTimer = null
+        let metaTimer = null
+        const rulesRef = { value: [] }
+        const enabledRef = { value: false }
+
+        const detach = () => {
+          if (subscription !== null) {
+            try { subscription() } catch {}
+            subscription = null
+          }
+          subscribedSession = undefined
+        }
+
+        const commit = (sessionId, rules, enabled) => {
+          if (cancelled) return
+          rulesRef.value = rules
+          enabledRef.value = enabled
+          setData((previous) => (
+            previous.sessionId === sessionId
+              && previous.billionContextEnabled === enabled
+              && sameRules(previous.rules, rules)
+              ? previous
+              : { sessionId, rules, billionContextEnabled: enabled }
+          ))
+        }
+
+        const attach = (sessionId) => {
+          detach()
+          if (sessionsApi === null) return false
+          let binding
+          try {
+            binding = sessionsApi.binding(sessionId)
+          } catch {
+            binding = undefined
+          }
+          const projections = binding?.session?.projections
+          if (projections === undefined || projections === null || typeof projections.faceOf !== 'function') return false
+          let face
+          try {
+            face = projections.faceOf(RULES_KEY)
+          } catch {
+            return false
+          }
+          if (face === null || typeof face !== 'object' || typeof face.subscribe !== 'function') return false
+          const readFace = () => {
+            if (cancelled) return
+            let value
+            try {
+              value = face.getSnapshot()
+            } catch {
+              return
+            }
+            commit(sessionId, normaliseRules(value?.rules), enabledRef.value)
+          }
+          try {
+            subscription = face.subscribe(readFace)
+            readFace()
+          } catch {
+            subscription = null
+            return false
+          }
+          subscribedSession = sessionId
+          return true
+        }
+
+        const ensurePoll = () => {
+          if (subscription !== null) {
+            if (pollTimer !== null) {
+              window.clearInterval(pollTimer)
+              pollTimer = null
             }
             return
           }
-          const payload = await readRules(sessionId, controller.signal)
-          if (cancelled || payload === undefined) return
-          const next = Array.isArray(payload.rules)
-            ? payload.rules
-              .filter((rule) => rule !== null && typeof rule === 'object' && typeof rule.text === 'string' && rule.text !== '')
-              .map((rule) => ({ id: String(rule.id ?? ''), text: rule.text }))
-            : []
-          const billionContextOn = payload.billionContextEnabled === true
-          setData((previous) => (
-            previous.sessionId === sessionId
-              && previous.billionContextEnabled === billionContextOn
-              && sameRules(previous.rules, next)
-              ? previous
-              : { sessionId, rules: next, billionContextEnabled: billionContextOn }
-          ))
+          if (pollTimer === null) pollTimer = window.setInterval(() => { void refresh() }, POLL_MS)
         }
-        void load()
-        const timer = window.setInterval(load, POLL_MS)
-        const refresh = () => { void load() }
-        window.addEventListener('focus', refresh)
-        document.addEventListener('visibilitychange', refresh)
+
+        const refresh = async () => {
+          const sessionId = visibleSessionId()
+          if (sessionId === undefined) {
+            detach()
+            commit(undefined, [], enabledRef.value)
+            ensurePoll()
+            return
+          }
+          if (subscribedSession !== sessionId) attach(sessionId)
+          ensurePoll()
+          if (document.visibilityState === 'hidden') return
+          const payload = await readRules(sessionId)
+          if (cancelled || payload === undefined) return
+          const enabled = payload.billionContextEnabled === true
+          const rules = subscription !== null ? rulesRef.value : normaliseRules(payload.rules)
+          commit(sessionId, rules, enabled)
+        }
+
+        const checkSession = () => {
+          const sessionId = visibleSessionId()
+          if (sessionId === subscribedSession) {
+            ensurePoll()
+            return
+          }
+          detach()
+          if (sessionId !== undefined) attach(sessionId)
+          ensurePoll()
+          void refresh()
+        }
+
+        const onFocus = () => { void refresh() }
+        const onVisibility = () => { void refresh() }
+
+        void refresh()
+        sessionTimer = window.setInterval(checkSession, SESSION_CHECK_MS)
+        metaTimer = window.setInterval(() => {
+          if (document.visibilityState === 'visible') void refresh()
+        }, META_MS)
+        window.addEventListener('focus', onFocus)
+        document.addEventListener('visibilitychange', onVisibility)
+
         return () => {
           cancelled = true
-          controller.abort()
-          window.clearInterval(timer)
-          window.removeEventListener('focus', refresh)
-          document.removeEventListener('visibilitychange', refresh)
+          detach()
+          if (pollTimer !== null) window.clearInterval(pollTimer)
+          if (sessionTimer !== null) window.clearInterval(sessionTimer)
+          if (metaTimer !== null) window.clearInterval(metaTimer)
+          window.removeEventListener('focus', onFocus)
+          document.removeEventListener('visibilitychange', onVisibility)
         }
       }, [])
 
+      // 布局通道：ResizeObserver 驱动，低频兜底重测。
       React.useEffect(() => {
         const update = () => {
           const next = measure()
           setPlace((previous) => (samePlace(previous, next) ? previous : next))
         }
-        const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(update) : null
+        const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => update()) : null
         let observed = null
         const track = () => {
           if (observer === null) return
@@ -240,12 +352,13 @@ window.__ModuleLoader__.load({
           observed = target
           if (target !== null) observer.observe(target)
         }
-        const tick = () => {
+        update()
+        track()
+        const timer = window.setInterval(() => {
+          if (document.visibilityState === 'hidden') return
           track()
           update()
-        }
-        tick()
-        const timer = window.setInterval(tick, MEASURE_MS)
+        }, MEASURE_FALLBACK_MS)
         window.addEventListener('resize', update)
         return () => {
           window.clearInterval(timer)
@@ -335,6 +448,12 @@ window.__ModuleLoader__.load({
           },
           AcpRulesPanel
         ))
+        // 投影订阅通道：sessions 服务可用时用会话绑定读 wire view（免轮询）。
+        try {
+          ctx.inject(['sessions'], (sessionCtx) => {
+            sessionsApi = sessionCtx.sessions
+          })
+        } catch {}
       }
     }
   }
