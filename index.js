@@ -11,7 +11,7 @@
  *    同时用它校准 billion-context 是否启用。
  */
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -275,13 +275,75 @@ function foldRules(session) {
   return visibleRules(state.rules)
 }
 
-/** 优先读增量投影，退不到投影时再全量折叠；via 用于诊断数据通道。 */
-function readRules(ctx, session) {
+/** bili 持久化状态库路径（bili 的 XDG data 目录下的 SQLite 库）。 */
+function biliStateDbPath() {
+  const dataHome = process.env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share')
+  return join(dataHome, 'billion-context', 'sessions', 'index.db')
+}
+
+let biliStorePromise
+
+/** 懒打开 bili 的 SQLite 只读连接；宿主不支持 node:sqlite 或库不存在时返回 null。 */
+function biliStore() {
+  if (biliStorePromise === undefined) {
+    biliStorePromise = import('node:sqlite')
+      .then(({ DatabaseSync }) => {
+        const file = biliStateDbPath()
+        return existsSync(file) ? new DatabaseSync(file, { readOnly: true }) : null
+      })
+      .catch(() => null)
+  }
+  return biliStorePromise
+}
+
+/**
+ * 读 bili kernel 状态里持久化的规则，覆盖面板等外部入口写入的规则：
+ * 这类规则没有会话事件里的 acp_rule 调用，fold 与投影都看不到。
+ */
+async function readBiliStoreRules(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return null
+  try {
+    const db = await biliStore()
+    if (db === null) return null
+    const row = db.prepare('SELECT kstate_json FROM sessions WHERE session_id = ?').get(sessionId)
+    if (row === undefined) return null
+    const state = JSON.parse(row.kstate_json ?? '{}')
+    const rules = Array.isArray(state.rules) ? state.rules : []
+    return rules
+      .filter((rule) => rule !== null && typeof rule === 'object' && typeof rule.text === 'string' && rule.text.trim() !== '')
+      .map((rule) => ({ id: String(rule.id ?? ''), text: String(rule.text) }))
+  } catch {
+    biliStorePromise = undefined
+    return null
+  }
+}
+
+/** 投影/折叠结果，再并上 bili 持久化状态里额外的规则；via 用于诊断数据通道。 */
+async function readRules(ctx, session, sessionId) {
+  let rules
+  let via
   try {
     const state = ctx.sessionProjections.stateOf(session, RULES_PROJECTION_KEY)
-    if (state !== undefined && state !== null) return { rules: visibleRules(state.rules), via: 'projection' }
+    if (state !== undefined && state !== null) {
+      rules = visibleRules(state.rules)
+      via = 'projection'
+    }
   } catch {}
-  return { rules: foldRules(session), via: 'fold' }
+  if (rules === undefined) {
+    rules = foldRules(session)
+    via = 'fold'
+  }
+  const stored = await readBiliStoreRules(sessionId)
+  if (stored === null || stored.length === 0) return { rules, via }
+  const keyOf = (rule) => (rule.id !== '' ? rule.id : rule.text)
+  const known = new Set(rules.map(keyOf))
+  const storeOnly = stored.filter((rule) => !known.has(keyOf(rule))).length
+  const merged = new Map()
+  for (const rule of stored) merged.set(keyOf(rule), rule)
+  for (const rule of rules) {
+    if (!merged.has(keyOf(rule))) merged.set(keyOf(rule), rule)
+  }
+  return { rules: [...merged.values()], via: storeOnly === 0 ? via : `${via}+bili-store` }
 }
 
 /** 找到聊天页当前显示的会话，活跃 agent 优先。 */
@@ -349,7 +411,7 @@ function billionContextEnabled() {
 
 /** 把规则列表与启用状态作为 JSON 返回给 Client（兜底与校准通道）。 */
 function handleState(ctx) {
-  return (request, response) => {
+  return async (request, response) => {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       response.writeHead(405, { allow: 'GET, HEAD' })
       response.end()
@@ -364,7 +426,7 @@ function handleState(ctx) {
       if (session === undefined) {
         payload = { ok: false, billionContextEnabled: billionContextOn, rules: [], error: 'session not found' }
       } else {
-        const loaded = readRules(ctx, session)
+        const loaded = await readRules(ctx, session, sessionId)
         payload = { ok: true, billionContextEnabled: billionContextOn, rules: loaded.rules, via: loaded.via }
       }
     } catch (error) {

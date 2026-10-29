@@ -258,7 +258,11 @@ window.__ModuleLoader__.load({
             } catch {
               return
             }
-            commit(sessionId, normaliseRules(value?.rules), enabledRef.value)
+            const wireRules = normaliseRules(value?.rules)
+            // 投影只认会话事件里的 acp_rule 调用；bili 面板等外部入口写入的规则不在投影里。
+            // 空投影不覆盖路由已拿到的规则，避免面板闪空。
+            if (wireRules.length === 0 && rulesRef.value.length > 0) return
+            commit(sessionId, wireRules, enabledRef.value)
           }
           try {
             subscription = face.subscribe(readFace)
@@ -296,7 +300,8 @@ window.__ModuleLoader__.load({
           const payload = await readRules(sessionId)
           if (cancelled || payload === undefined) return
           const enabled = payload.billionContextEnabled === true
-          const rules = subscription !== null ? rulesRef.value : normaliseRules(payload.rules)
+          // 路由已把投影与 bili 持久化状态合并，优先采用；订阅只负责即时补投影内的新规则。
+          const rules = normaliseRules(payload.rules)
           commit(sessionId, rules, enabled)
         }
 
