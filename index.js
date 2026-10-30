@@ -424,7 +424,10 @@ function handleState(ctx) {
       const session = findSession(ctx, sessionId)
       const billionContextOn = billionContextEnabled()
       if (session === undefined) {
-        payload = { ok: false, billionContextEnabled: billionContextOn, rules: [], error: 'session not found' }
+        const stored = await readBiliStoreRules(sessionId)
+        payload = stored !== null && stored.length > 0
+          ? { ok: true, billionContextEnabled: billionContextOn, rules: stored, via: 'bili-store' }
+          : { ok: false, billionContextEnabled: billionContextOn, rules: [], error: 'session not found' }
       } else {
         const loaded = await readRules(ctx, session, sessionId)
         payload = { ok: true, billionContextEnabled: billionContextOn, rules: loaded.rules, via: loaded.via }
