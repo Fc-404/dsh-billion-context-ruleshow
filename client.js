@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
     const RULES_KEY = 'billion-context-rules'
 
     /** 兜底轮询间隔：只在订阅不可用时使用。 */
-    const POLL_MS = 5000
+    const POLL_MS = 3000
     /** 校准间隔：低频拉取 billion-context 是否启用（订阅通道不带该字段）。 */
     const META_MS = 15000
     /** 可见会话检查间隔：只读 DOM，代价极低。 */
@@ -275,14 +275,9 @@ window.__ModuleLoader__.load({
           return true
         }
 
+        // 轮询常开：投影只覆盖会话事件里的 acp_rule 调用，bili 面板等外部入口写入的规则没有事件，
+        // 只能靠定期拉路由感知，所以订阅成功后也保留低频轮询。
         const ensurePoll = () => {
-          if (subscription !== null) {
-            if (pollTimer !== null) {
-              window.clearInterval(pollTimer)
-              pollTimer = null
-            }
-            return
-          }
           if (pollTimer === null) pollTimer = window.setInterval(() => { void refresh() }, POLL_MS)
         }
 
